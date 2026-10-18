@@ -1,0 +1,19 @@
+# Estado local, locks, filas privadas e credenciais (NUNCA versionar)
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.lock
+*.log
+*.tmp
+__pycache__/
+drafts/
+heartbeats/
+runner-diagnostics/
+sentinela_stark_state.json
+propostas_pendentes.json
+panel.json
+policy.json
+primary-launch-profiles.json
+validacao-*.json
+versao-local.json
+.env
