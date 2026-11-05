@@ -150,3 +150,9 @@ Ao redigir, propor ou disparar mensagens pelo WhatsApp (para clientes, parceiros
 6. **Destaque termos-chave** com `*negrito do WhatsApp*` (ex: `*tabela de produtos*`, `*API oficial*`, `*Business Manager*`).
 7. **Fechamento / Call-to-action em linha isolada** após linha em branco (ex: `Fico no aguardo do retorno de vocês para darmos o próximo passo.`).
 <!-- /diretriz-formatacao-whatsapp-20261104 -->
+
+
+## Sincronização Automática com o GitHub (`brunoYves22`)
+Sempre que uma tarefa envolver qualquer alteração de código, interface ou instrução em `FLOW-Reserva`, execute ao concluir:
+`python -X utf8 operacoes/github_sync.py "feat/fix: descrição da alteração"`
+Isso cria um commit automático e faz `git push` para `flow-reunioes` e `stark-agente-whatsapp-24h` no GitHub de Bruno.
