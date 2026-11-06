@@ -125,10 +125,81 @@ def run_youtrack_proxy(actor):
         print(json.dumps(reply, ensure_ascii=False), flush=True)
 
 
+
+def run_synapse_admin_proxy():
+    import urllib.request
+    token = os.environ.get("SYNAPSE_ADMIN_MCP_TOKEN")
+    if not token:
+        import winreg
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as key:
+                token = winreg.QueryValueEx(key, "SYNAPSE_ADMIN_MCP_TOKEN")[0]
+        except OSError:
+            pass
+    if not token:
+        raise ValueError("Token SYNAPSE_ADMIN_MCP_TOKEN ausente neste PC; configure localmente")
+
+    url = "https://admin.synapse-agents.com.br/mcp"
+    headers = {
+        "Authorization": "Bearer " + token,
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+        "User-Agent": "AGY-MCP-Bridge/1.0",
+    }
+
+    def remote_call(method, params=None, req_id=1):
+        payload = {"jsonrpc": "2.0", "id": req_id, "method": method, "params": params or {}}
+        req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers)
+        with urllib.request.urlopen(req, timeout=40) as resp:
+            if resp.headers.get("Mcp-Session-Id"):
+                headers["Mcp-Session-Id"] = resp.headers["Mcp-Session-Id"]
+            raw = resp.read().decode("utf-8")
+            ctype = resp.headers.get("Content-Type", "")
+            if "text/event-stream" in ctype:
+                val = json.loads("\n".join(x[5:].strip() for x in raw.splitlines() if x.startswith("data:")))
+            else:
+                val = json.loads(raw)
+            if val.get("error"):
+                raise ValueError(val["error"].get("message", "Erro MCP synapse-admin"))
+            return val.get("result")
+
+    for line in sys.stdin:
+        request = {}
+        try:
+            request = json.loads(line)
+            if "id" not in request:
+                continue
+            method = request.get("method")
+            params = request.get("params", {})
+            if method == "initialize":
+                result = {
+                    "protocolVersion": params.get("protocolVersion", "2024-11-05"),
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "synapse-admin", "version": "1.0.0"},
+                }
+            elif method == "ping":
+                result = {}
+            elif method == "tools/list":
+                result = remote_call("tools/list", {}, request["id"])
+            elif method == "tools/call":
+                result = remote_call("tools/call", {"name": params.get("name"), "arguments": params.get("arguments", {})}, request["id"])
+            else:
+                raise ValueError("Metodo MCP nao suportado")
+            reply = {"jsonrpc": "2.0", "id": request["id"], "result": result}
+        except Exception as error:
+            detail = str(error) if isinstance(error, ValueError) else type(error).__name__
+            reply = {
+                "jsonrpc": "2.0",
+                "id": request.get("id") if isinstance(request, dict) else None,
+                "error": {"code": -32603, "message": detail},
+            }
+        print(json.dumps(reply, ensure_ascii=False), flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--server", required=True, choices=[
-        "flow_operacoes", "flow_reserve", "flow_maestri", "flow_whatsapp_local", "youtrack"
+        "flow_operacoes", "flow_reserve", "flow_maestri", "flow_whatsapp_local", "youtrack", "synapse-admin"
     ])
     parser.add_argument("--role", default="auto")
     opts = parser.parse_args()
@@ -139,6 +210,9 @@ def main():
 
     if opts.server == "youtrack":
         run_youtrack_proxy(reserve_actor)
+        return
+    if opts.server == "synapse-admin":
+        run_synapse_admin_proxy()
         return
 
     if opts.server == "flow_operacoes":
