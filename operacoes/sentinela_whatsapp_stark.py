@@ -190,9 +190,45 @@ def transcribe_audio_base64(root, b64_str):
         if tmp_ogg.exists(): tmp_ogg.unlink()
         if tmp_wav.exists(): tmp_wav.unlink()
 
+def heal_whatsapp_indexeddb():
+    """Garante que o ponteiro CURRENT de todas as partições IndexedDB do WhatsApp aponte para o MANIFEST mais recente no disco."""
+    repaired = []
+    try:
+        appdata = os.environ.get("APPDATA")
+        if not appdata:
+            return repaired
+        parts_dir = Path(appdata) / "Maestri" / "Partitions"
+        if not parts_dir.exists():
+            return repaired
+        for ldb_dir in parts_dir.glob("portal-*/IndexedDB/*whatsapp*.indexeddb.leveldb"):
+            if not ldb_dir.is_dir():
+                continue
+            manifests = sorted(ldb_dir.glob("MANIFEST-*"), key=lambda p: p.stat().st_mtime, reverse=True)
+            if not manifests:
+                continue
+            latest_name = manifests[0].name
+            cur_file = ldb_dir / "CURRENT"
+            cur_val = ""
+            if cur_file.exists():
+                try:
+                    cur_val = cur_file.read_text(encoding="utf-8", errors="ignore").strip()
+                except Exception:
+                    cur_val = ""
+            if cur_val != latest_name and not (ldb_dir / cur_val).exists():
+                cur_file.write_bytes((latest_name + "\n").encode("ascii"))
+                repaired.append(f"{ldb_dir.parent.parent.name}:{cur_val}->{latest_name}")
+    except Exception:
+        pass
+    return repaired
+
 def monitor_loop(root, server_state):
     from operacoes.audio_whatsapp import open_for_read
+    from operacoes.portal import portal_lock
     import ponte_maestri
+
+    healed = heal_whatsapp_indexeddb()
+    if healed:
+        print(f"[+] Auto-reparo LevelDB IndexedDB aplicado: {healed}")
 
     state_file = root / "operacoes" / "sentinela_stark_state.json"
     seen_ids = set()
@@ -210,12 +246,23 @@ def monitor_loop(root, server_state):
     recent_cmd_hashes = {}
     last_keepalive = 0
     last_open_attempt = 0
+    last_loop_ts = time.time()
+    storage_persisted = False
 
-    print(f"[*] Sentinela Stark iniciado. Monitorando grupo '{GROUP_NAME}' 24h...")
+    print(f"[*] Sentinela Stark iniciado com Blindagem Anti-Desconexão LevelDB. Monitorando grupo '{GROUP_NAME}' 24h...")
 
     while True:
         try:
             now = time.time()
+            # Proteção Anti-Corrupção ao acordar da suspensão/hibernação do Windows:
+            # Se houve salto de relógio > 20s, aguardar 15s para o Chromium concluir a compactação do IndexedDB sem concorrência.
+            if now - last_loop_ts > 20:
+                print("[*] Retorno de suspensão detectado. Aguardando 15s para compactação segura do IndexedDB do WhatsApp...")
+                heal_whatsapp_indexeddb()
+                time.sleep(15)
+                now = time.time()
+            last_loop_ts = now
+
             if "server" in server_state:
                 server_state["server"].last_check = now
 
@@ -225,48 +272,80 @@ def monitor_loop(root, server_state):
 
             client = get_whatsapp_client(root, portal_name)
 
-            # Verificar se o portal está acessível
+            # Verificar se o portal está acessível sob lock compartilhado para nunca colidir com outros workers
             try:
-                snap = client.snapshot()
+                with portal_lock({"runtime": str(root)}, portal_name):
+                    snap = client.snapshot()
                 portal_ready = bool(snap and "@e" in snap)
-                qr_required = "Escaneie o QR code" in snap or "QR code" in snap
+                qr_required = ("Escaneie o QR code" in snap or "QR code" in snap or "Escaneie para entrar" in snap)
+                db_error = "erro no banco de dados do seu navegador" in (snap or "").lower()
+                is_syncing = any(k in (snap or "").lower() for k in ("carregando suas conversas", "sincronizando", "conectando"))
             except Exception:
                 portal_ready = False
                 qr_required = False
+                db_error = False
+                is_syncing = False
 
-            if "server" in server_state:
-                server_state["server"].portal_ready = portal_ready
-                server_state["server"].qr_required = qr_required
-                server_state["server"].current_status = "online" if portal_ready else "aguardando_portal"
-            write_sentinel_heartbeat(root, server_state)
-
-            if not portal_ready:
-                time.sleep(4)
+            if db_error:
+                # Auto-cura imediata se o LevelDB acusar erro de manifesto ou RSTData preso
+                healed_now = heal_whatsapp_indexeddb()
+                try:
+                    with portal_lock({"runtime": str(root)}, portal_name):
+                        client.call("evaluate", "localStorage.removeItem('RSTData'); localStorage.removeItem('whatsapp-mutex');")
+                        if healed_now:
+                            client.call("navigate", "https://web.whatsapp.com/")
+                except Exception:
+                    pass
+                time.sleep(8)
                 continue
 
-            # Keep-alive a cada 5 minutos
-            if now - last_keepalive > 300:
+            if "server" in server_state:
+                server_state["server"].portal_ready = portal_ready and not qr_required
+                server_state["server"].qr_required = qr_required
+                server_state["server"].current_status = "qr_pendente" if qr_required else ("online" if portal_ready else "aguardando_portal")
+            write_sentinel_heartbeat(root, server_state)
+
+            # Não interagir com o DOM enquanto estiver na tela de QR Code ou sincronizando banco inicial
+            if not portal_ready or qr_required or is_syncing:
+                storage_persisted = False
+                time.sleep(6)
+                continue
+
+            # Blindagem de armazenamento persistente no Chromium (uma vez por sessão autenticada)
+            if not storage_persisted:
                 try:
-                    client.call("evaluate", "window.dispatchEvent(new Event('mousemove'));")
+                    with portal_lock({"runtime": str(root)}, portal_name):
+                        client.call("evaluate", "(async()=>{try{localStorage.removeItem('RSTData');if(navigator.storage&&navigator.storage.persist){await navigator.storage.persist();}if(navigator.wakeLock&&navigator.wakeLock.request){window._waWakeLock=await navigator.wakeLock.request('screen').catch(()=>null);}}catch(_){}})()")
+                    storage_persisted = True
+                except Exception:
+                    pass
+
+            # Keep-alive suave a cada 3 minutos (mantém WebSocket e IndexedDB aquecidos sem recarregar a página)
+            if now - last_keepalive > 180:
+                try:
+                    with portal_lock({"runtime": str(root)}, portal_name):
+                        client.call("evaluate", "window.dispatchEvent(new Event('mousemove')); localStorage.removeItem('RSTData');")
                     last_keepalive = now
                 except Exception:
                     pass
 
-            # Garantir foco no grupo MAESTRI
-            in_group = GROUP_NAME.lower() in (snap or "").lower()
-            if not in_group or now - last_open_attempt > 60:
+            # Garantir foco no grupo MAESTRI apenas quando realmente não estiver aberto (evita re-clicar a cada 60s)
+            in_group = (f'textbox "Digite uma mensagem para o grupo {GROUP_NAME}' in (snap or "") or f'button "{GROUP_NAME}' in (snap or "") or GROUP_NAME.lower() in (snap or "").lower())
+            if not in_group and now - last_open_attempt > 15:
                 try:
-                    client = open_for_read(client.context, GROUP_NAME)
+                    with portal_lock({"runtime": str(root)}, portal_name):
+                        client = open_for_read(client.context, GROUP_NAME)
                     last_open_attempt = now
                 except Exception:
-                    time.sleep(3)
+                    time.sleep(4)
                     continue
 
-            # Ler mensagens do chat ativo
+            # Ler mensagens do chat ativo sob lock
             try:
-                msgs = client.messages()
+                with portal_lock({"runtime": str(root)}, portal_name):
+                    msgs = client.messages()
             except Exception:
-                time.sleep(2)
+                time.sleep(3)
                 continue
 
             # Limpar debounce antigo (> 10 minutos)
