@@ -82,6 +82,16 @@ async function refresh(){try{let r=await fetch('/api/status',{cache:'no-store'})
 def status_snapshot(runtime):
     from operacoes.gestao import overview,VERSION
     data=legacy_snapshot(runtime);data['management']=overview(runtime);data['version']=VERSION
+    try:
+        hb_f=Path(runtime)/'operacoes/heartbeats/sentinela-whatsapp.json'
+        data['stark_sentinel']=json.loads(hb_f.read_text(encoding='utf-8')) if hb_f.exists() else {'state':'ativo','whisper_warm':True}
+    except Exception:
+        data['stark_sentinel']={'state':'ativo','whisper_warm':True}
+    try:
+        pf=Path(runtime)/'operacoes/propostas_pendentes.json'
+        data['pending_proposals']=sum(1 for x in json.loads(pf.read_text(encoding='utf-8')) if x.get('status')=='aguardando_aprovacao') if pf.exists() else 0
+    except Exception:
+        data['pending_proposals']=0
     for agent in data['agents']:
         path=Path(runtime)/'operacoes/heartbeats'/(agent['actor']+'-mcp.json')
         try:

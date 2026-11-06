@@ -138,12 +138,40 @@ def get_whatsapp_client(root, portal_name):
     registry["primary_terminal"] = stark_tid
     return Client({"runtime": str(root), "registry": registry, "whatsapp_portal": portal_name})
 
+_WHISPER_MODEL = None
+
+def get_whisper_model(root):
+    global _WHISPER_MODEL
+    if _WHISPER_MODEL is None:
+        from faster_whisper import WhisperModel
+        cfg = root / "reunioes" / "models"
+        _WHISPER_MODEL = WhisperModel("base", device="cpu", compute_type="int8", download_root=str(cfg))
+    return _WHISPER_MODEL
+
+def write_sentinel_heartbeat(root, server_state):
+    try:
+        hb_dir = root / "operacoes" / "heartbeats"
+        hb_dir.mkdir(parents=True, exist_ok=True)
+        srv = server_state.get("server")
+        hb_data = {
+            "observed": time.time(),
+            "service": "sentinela_whatsapp_stark",
+            "group": GROUP_NAME,
+            "status": getattr(srv, "current_status", "online") if srv else "online",
+            "portal_name": getattr(srv, "portal_name", "WhatsApp — Atendimento FLOW #2") if srv else "WhatsApp — Atendimento FLOW #2",
+            "portal_ready": getattr(srv, "portal_ready", False) if srv else False,
+            "qr_required": getattr(srv, "qr_required", False) if srv else False,
+            "processed_count": getattr(srv, "processed_count", 0) if srv else 0,
+            "last_processed": getattr(srv, "last_processed", None) if srv else None
+        }
+        (hb_dir / "sentinela-whatsapp.json").write_text(json.dumps(hb_data, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
 def transcribe_audio_base64(root, b64_str):
     import wave
     import numpy as np
-    from faster_whisper import WhisperModel
-    cfg = root / "reunioes" / "models"
-    model = WhisperModel("base", device="cpu", compute_type="int8", download_root=str(cfg))
+    model = get_whisper_model(root)
     audio_bytes = base64.b64decode(b64_str)
     tmp_ogg = root / "scratch" / f"wa_temp_{int(time.time()*1000)}.ogg"
     tmp_ogg.parent.mkdir(parents=True, exist_ok=True)
@@ -210,6 +238,7 @@ def monitor_loop(root, server_state):
                 server_state["server"].portal_ready = portal_ready
                 server_state["server"].qr_required = qr_required
                 server_state["server"].current_status = "online" if portal_ready else "aguardando_portal"
+            write_sentinel_heartbeat(root, server_state)
 
             if not portal_ready:
                 time.sleep(4)
@@ -353,6 +382,7 @@ def monitor_loop(root, server_state):
                         "sender": sender,
                         "command": text[:120]
                     }
+                    write_sentinel_heartbeat(root, server_state)
 
         except Exception as e:
             import traceback

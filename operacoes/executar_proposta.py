@@ -34,6 +34,36 @@ def registrar_entrega_obsidian(item):
     except Exception as err:
         print(f"[!] Erro ao registrar entrega no Obsidian: {err}")
 
+def sincronizar_acao_reuniao(root, item):
+    try:
+        mid = item.get("meeting_id")
+        if not mid:
+            return
+        analysis_file = Path(root) / "reunioes" / "jobs" / mid / "analysis.json"
+        if not analysis_file.exists():
+            return
+        data = json.loads(analysis_file.read_text(encoding="utf-8"))
+        bruno_items = data.get("direcionado_para_bruno", [])
+        action_text = (item.get("action") or "").strip().lower()
+        area_text = (item.get("area") or "").strip().lower()
+        matched = False
+        for b in bruno_items:
+            b_act = (b.get("action") or b.get("description") or "").strip().lower()
+            b_area = (b.get("area") or "").strip().lower()
+            if (action_text and action_text[:28] in b_act) or (area_text and area_text == b_area and not b.get("done")):
+                b["done"] = True
+                matched = True
+                break
+        if matched:
+            analysis_file.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            try:
+                from reunioes.core import note
+                note(Path(root), mid)
+            except Exception:
+                pass
+    except Exception as err:
+        print(f"[!] Aviso ao sincronizar ação na reunião: {err}")
+
 def criar_card_youtrack_interno(root, item):
     try:
         sys.path.insert(0, str(root / "code"))
@@ -104,7 +134,11 @@ def executar_proposta(root, prop_id=None, execute_all=False):
     from operacoes.whatsapp import Client
     from operacoes.audio_whatsapp import open_for_read
 
-    portal_name = "WhatsApp — Atendimento FLOW #2"
+    try:
+        from operacoes.sentinela_whatsapp_stark import find_active_portal
+        portal_name = find_active_portal(reg, stark_tid)
+    except Exception:
+        portal_name = "WhatsApp — Atendimento FLOW #2"
     op_wa.PORTAL = portal_name
     client = Client({"runtime": str(root), "registry": reg, "whatsapp_portal": portal_name, "primary_terminal": stark_tid})
 
@@ -149,8 +183,10 @@ def executar_proposta(root, prop_id=None, execute_all=False):
             else:
                 results.append(f"📋 Proposta [{pid}] (Ação Interna): Registrada para acompanhamento.")
 
-        # Registrar no Obsidian
+        # Registrar no Obsidian e sincronizar com FLOW Reuniões
         registrar_entrega_obsidian(item)
+        if item.get('status') in ('executada', 'card_criado_youtrack', 'registrada_internamente'):
+            sincronizar_acao_reuniao(root, item)
 
     # Salvar estado atualizado
     p_file.write_text(json.dumps(propostas, ensure_ascii=False, indent=2), encoding="utf-8")
