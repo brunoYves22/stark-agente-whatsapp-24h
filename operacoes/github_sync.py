@@ -36,6 +36,7 @@ STARK_FILES = [
     "operacoes/destinatarios.py", "operacoes/contatos.py", "operacoes/formatacao_whatsapp.py",
     "operacoes/whatsapp.py", "operacoes/fila_whatsapp.py", "operacoes/pesquisa_whatsapp.py",
     "operacoes/audio_whatsapp.py", "operacoes/sentinela_whatsapp_stark.py",
+    "operacoes/monitor_youtrack_entregas.py",
     "operacoes/executar_proposta.py", "operacoes/github_sync.py",
     "operacoes/painel_operacional.html", "operacoes/central.js",
     "instructions/orquestrador.md", "instructions/analista-youtrack.md",
