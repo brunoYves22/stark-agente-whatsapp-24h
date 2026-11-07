@@ -83,30 +83,56 @@ def is_client_visible_issue(issue: dict) -> bool:
     return True
 
 
-def detect_client_group(issue: dict, root: Path):
-    """Procura menção explícita a cliente ou grupo no título, descrição ou tags (ignorando a tag padrão 'Estrela')."""
+def resolve_group_alias(raw_name: str, root: Path) -> str:
+    """Converte um apelido curto (ex: 'Oca', 'Lidia', 'Paycard') no nome exato do grupo do WhatsApp."""
+    if not raw_name:
+        return ""
+    clean = str(raw_name).strip()
+    low = clean.lower()
     mapping = load_client_group_map(root)
-    summary = (issue.get("summary") or "")
-    desc = (issue.get("description") or "")
-    tags = [t for t in (issue.get("tags") or []) if str(t).lower() not in ("estrela", "star")]
+    if low in mapping:
+        return mapping[low]
+    for k, grp in sorted(mapping.items(), key=lambda x: len(x[0]), reverse=True):
+        if low == k or f" {k}" in f" {low} ":
+            return grp
+    return clean
 
-    # 1. Procurar padrão explícito "grupo <Nome>" na descrição
-    m_grp = re.search(r"grupo\s+([A-Za-zÀ-ÿ0-9_<> -]{3,35}?)(?:[,.;\n)]|$)", desc, re.IGNORECASE)
-    if m_grp:
-        candidate = m_grp.group(1).strip()
-        cand_low = candidate.lower()
-        for k, grp in mapping.items():
-            if k in cand_low or cand_low in k:
-                return grp
-        return candidate
 
-    # 2. Procurar nas tags, summary e description pelas chaves do mapa (da maior chave para a menor)
-    haystack = " | ".join([*tags, summary, desc]).lower()
-    for key in sorted(mapping.keys(), key=len, reverse=True):
-        if re.search(r"(?<![a-z0-9])" + re.escape(key) + r"(?![a-z0-9])", haystack):
-            return mapping[key]
+def detect_client_group(issue: dict, root: Path):
+    """
+    Procura menção explícita a cliente ou grupo no título, descrição, tags ou comentários.
+    Retorna (detected_group, mention_snippet).
+    """
+    mapping = load_client_group_map(root)
+    summary = (issue.get("summary") or "").strip()
+    desc = (issue.get("description") or "").strip()
+    comments_text = "\n".join(str(c.get("text") or "") for c in (issue.get("comments") or []))
+    tags = [str(t).strip() for t in (issue.get("tags") or []) if str(t).lower() not in ("estrela", "star")]
 
-    return None
+    # 1. Procurar linha explícita de Origem / Cliente / Relato / Grupo na descrição ou comentários
+    for source_label, text_block in (("descrição", desc), ("título", summary), ("comentários", comments_text)):
+        for line in text_block.splitlines():
+            clean_line = re.sub(r"[*_#>`~]+", "", line).strip()
+            if not clean_line:
+                continue
+            m_grp = re.search(r"grupo\s+([A-Za-zÀ-ÿ0-9_<> -]{3,35}?)(?:[,.;\n)]|$)", clean_line, re.IGNORECASE)
+            if m_grp:
+                grp = resolve_group_alias(m_grp.group(1).strip(), root)
+                return grp, clean_line[:110]
+
+            low_line = clean_line.lower()
+            for key in sorted(mapping.keys(), key=len, reverse=True):
+                if re.search(r"(?<![a-z0-9])" + re.escape(key) + r"(?![a-z0-9])", low_line):
+                    return mapping[key], f'{clean_line[:110]} ({source_label})'
+
+    # 2. Procurar nas tags (exceto Estrela/Star)
+    for tag in tags:
+        t_low = tag.lower()
+        for key in sorted(mapping.keys(), key=len, reverse=True):
+            if key in t_low or t_low in key:
+                return mapping[key], f'Tag "{tag}"'
+
+    return None, None
 
 
 def clean_summary_for_client(summary: str) -> str:
@@ -173,34 +199,32 @@ def build_client_delivery_message(issue: dict) -> str:
     return "\n".join(lines)
 
 
-def build_maestri_prompt_message(issue: dict, prop_id: int, detected_group, draft_msg: str) -> str:
-    """Formata o aviso que o Sentinela posta no grupo MAESTRI para Bruno decidir com 1 comando."""
+def build_maestri_prompt_message(issue: dict, prop_id: int, detected_group, mention_snippet, draft_msg: str) -> str:
+    """Formata o aviso híbrido (A + B) que o Sentinela posta no grupo MAESTRI para Bruno decidir."""
     yid = issue.get("id")
     summary = issue.get("summary") or ""
-    issue_type = (issue.get("customFields") or {}).get("Type") or "Tarefa"
 
     if detected_group:
+        mention_txt = f'"{mention_snippet}"' if mention_snippet else f'"{detected_group}"'
         return (
-            f"*FLOW Entregas (YouTrack):* Card *{yid}* ({issue_type}) marcado como *Concluída*! ✅\n\n"
-            f"• *Entrega:* {summary}\n"
-            f"• *Grupo do cliente identificado:* *{detected_group}*\n\n"
-            f"*Mensagem sugerida (Proposta #{prop_id}):*\n"
+            f"*FLOW Entregas (YouTrack):* O ticket *{yid}* (*{summary}*) foi concluído! ✅\n\n"
+            f"• *Menção identificada no ticket:* {mention_txt}\n"
+            f"• *Vai para o grupo:* *{detected_group}*\n\n"
+            f"*Mensagem pronta para envio (Proposta #{prop_id}):*\n"
             f"\"{draft_msg}\"\n\n"
-            f"👉 *Como deseja proceder?*\n"
-            f"• Responda *@Stark aprovar {prop_id}* para enviar agora ao grupo *{detected_group}*\n"
-            f"• Responda *@Stark enviar {prop_id} para <Outro Grupo>* se quiser mudar o destino\n"
-            f"• Responda *@Stark ignorar {prop_id}* para não notificar"
+            f"👉 *Posso enviar para o grupo {detected_group}?*\n"
+            f"• Para aprovar: *@Stark aprovar {prop_id}*\n"
+            f"• Para outro grupo: *@Stark enviar {prop_id} para <Nome do Grupo>*\n"
+            f"• Para descartar: *@Stark ignorar {prop_id}*"
         )
     else:
         return (
-            f"*FLOW Entregas (YouTrack):* Card *{yid}* ({issue_type}) marcado como *Concluída*! 🔔\n\n"
-            f"• *Entrega:* {summary}\n"
-            f"• *Impacto:* Alteração visível no FLOW, mas o card não especifica qual cliente pediu.\n\n"
+            f"*FLOW Entregas (YouTrack):* A tarefa *{yid}* (*{summary}*) foi concluída, *mas no ticket não informa quem pediu e não sei para onde enviar*. 🔔\n\n"
             f"*Mensagem pronta para envio (Proposta #{prop_id}):*\n"
             f"\"{draft_msg}\"\n\n"
-            f"👉 *Essa alteração foi pedida por algum cliente?*\n"
-            f"• Responda *@Stark enviar {prop_id} para <Nome do Grupo>* (ex: *@Stark enviar {prop_id} para Flow - Oca*)\n"
-            f"• Ou responda *@Stark ignorar {prop_id}* se não precisar avisar ninguém"
+            f"👉 *Para qual grupo devo enviar?*\n"
+            f"• Me informe o destino: *@Stark enviar {prop_id} para <Nome do Grupo>* (ex: *@Stark enviar {prop_id} para Oca*)\n"
+            f"• Ou descarte se não precisar avisar: *@Stark ignorar {prop_id}*"
         )
 
 
@@ -262,11 +286,25 @@ def fetch_full_issue(issue_id: str) -> dict:
         "name": "get_issue",
         "arguments": {"issueId": issue_id},
     })
+    issue_data = {}
     content = (res or {}).get("content") or []
     for block in content:
         if block.get("type") == "text":
-            return json.loads(block["text"])
-    return {}
+            issue_data = json.loads(block["text"])
+            break
+    if issue_data and issue_data.get("commentsCount", 0) > 0:
+        try:
+            c_res = call("tools/call", {
+                "name": "get_issue_comments",
+                "arguments": {"issueId": issue_id, "limit": 10},
+            })
+            for block in (c_res or {}).get("content") or []:
+                if block.get("type") == "text":
+                    c_data = json.loads(block["text"])
+                    issue_data["comments"] = c_data.get("commentsPage") or c_data if isinstance(c_data, list) else []
+        except Exception:
+            pass
+    return issue_data
 
 
 def poll_youtrack_resolved(root: Path, send_maestri_fn=None, simulate_issue_id: str = None) -> list:
@@ -317,16 +355,17 @@ def poll_youtrack_resolved(root: Path, send_maestri_fn=None, simulate_issue_id: 
         yid = issue.get("id")
         if not is_client_visible_issue(issue):
             continue
-        detected_group = detect_client_group(issue, root)
+        detected_group, mention_snippet = detect_client_group(issue, root)
         draft_msg = build_client_delivery_message(issue)
         prop_id = register_youtrack_proposal(root, issue, detected_group, draft_msg)
-        maestri_msg = build_maestri_prompt_message(issue, prop_id, detected_group, draft_msg)
+        maestri_msg = build_maestri_prompt_message(issue, prop_id, detected_group, mention_snippet, draft_msg)
         if send_maestri_fn:
             send_maestri_fn(maestri_msg)
         notifications.append({
             "issue_id": yid,
             "proposal_id": prop_id,
             "detected_group": detected_group,
+            "mention_snippet": mention_snippet,
             "maestri_message": maestri_msg,
         })
 
