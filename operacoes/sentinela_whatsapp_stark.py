@@ -56,6 +56,7 @@ BOT_MESSAGE_PATTERNS = [
     re.compile(r"demanda recusada", re.IGNORECASE),
     re.compile(r"parada operacional", re.IGNORECASE),
     re.compile(r"FLOW Reuniões:", re.IGNORECASE),
+    re.compile(r"FLOW Entregas \(YouTrack\):", re.IGNORECASE),
     re.compile(r"PLANO DE AÇÃO PROPOSTO", re.IGNORECASE),
     re.compile(r"MENSAGENS SUGERIDAS PARA ENVIO", re.IGNORECASE),
     re.compile(r"AÇÕES OPERACIONAIS / INTERNAS", re.IGNORECASE),
@@ -348,6 +349,7 @@ def monitor_loop(root, server_state):
     storage_persisted = False
     offline_since = None
     last_alert_ts = 0
+    last_youtrack_poll = 0
 
     expire_old_proposals(root)
     load_allowed_senders(root)
@@ -442,6 +444,25 @@ def monitor_loop(root, server_state):
                 except Exception:
                     pass
 
+            # Monitoramento automático de entregas concluídas no YouTrack (a cada 90 segundos)
+            if now - last_youtrack_poll > 90:
+                last_youtrack_poll = now
+                try:
+                    from operacoes.monitor_youtrack_entregas import poll_youtrack_resolved
+                    def _post_maestri_yt(msg_yt):
+                        with portal_lock({"runtime": str(root)}, portal_name):
+                            c_yt = open_for_read(client.context, GROUP_NAME)
+                            time.sleep(0.4)
+                            c_yt.set_draft(msg_yt)
+                            time.sleep(0.4)
+                            c_yt.commit()
+                            time.sleep(0.6)
+                    yt_events = poll_youtrack_resolved(root, send_maestri_fn=_post_maestri_yt)
+                    for ev in yt_events:
+                        log_event(root, f"[YOUTRACK CONCLUÍDA] Card {ev['issue_id']} -> Proposta #{ev['proposal_id']} (grupo={ev['detected_group'] or 'A_DEFINIR'})")
+                except Exception as yt_err:
+                    log_event(root, f"[AVISO YOUTRACK] Falha ao checar entregas concluídas: {yt_err}")
+
             # Keep-alive suave a cada 3 minutos (mantém WebSocket e IndexedDB aquecidos sem recarregar a página)
             if now - last_keepalive > 180:
                 try:
@@ -531,10 +552,33 @@ def monitor_loop(root, server_state):
                 log_event(root, f"[GATILHO VÁLIDO] de {sender}: '{text[:120]}'")
 
                 # Injetar tarefa no terminal do Stark via Maestri IPC com DIRETRIZ SUPREMA DE AUTONOMIA
+                match_ignore = re.search(r'(?i)\b(?:ignorar?|descartar?|cancelar?|pular?)\s+(?:a\s+|proposta\s+)?(\d+)\b', text)
+                match_dest = re.search(r'(?i)\b(?:enviar?|envia|mandar?|manda|aprovar?|aprova|disparar?)\s+(?:a\s+|proposta\s+)?(\d+)\s+(?:para\s+o\s+grupo|no\s+grupo|pro\s+grupo|para|pro|em|no)\s+([A-Za-zÀ-ÿ0-9_<> -]{2,50})', text)
                 match_aprov = re.search(r'(?i)(?:aprova[r]?|ok|sim|enviar|envia|manda|dispara|executa[r]?|confirma[r]?)?\s*(\d+|tudo|todas|all)\b', text)
-                has_custom_edits = any(w in text.lower() for w in ['altera', 'mudar', 'trocar', 'modificar', 'apagar', 'porém', 'porem', 'mande no grupo', 'mande nó grupo'])
+                has_custom_edits = any(w in text.lower() for w in ['altera', 'mudar', 'trocar', 'modificar', 'apagar', 'porém', 'porem'])
 
-                if match_aprov and not has_custom_edits:
+                if match_ignore:
+                    target_id = match_ignore.group(1)
+                    cli_cmd = f"python operacoes/executar_proposta.py --id {target_id} --ignorar"
+                    stark_prompt = (
+                        f"ORDEM DIRETA DE BRUNO VIA WHATSAPP (Grupo MAESTRI por {sender}):\n\n"
+                        f"\"{text}\"\n\n"
+                        f"⚡ COMANDO DE DESCARTE DE PROPOSTA DETECTADO:\n"
+                        f"Execute imediatamente no seu terminal:\n{cli_cmd}\n\n"
+                        f"Publique no grupo MAESTRI confirmando que a proposta #{target_id} foi ignorada."
+                    )
+                elif match_dest and not has_custom_edits:
+                    target_id = match_dest.group(1)
+                    dest_grp = match_dest.group(2).strip().strip('."\'')
+                    cli_cmd = f'python operacoes/executar_proposta.py --id {target_id} --destino "{dest_grp}"'
+                    stark_prompt = (
+                        f"ORDEM DIRETA DE BRUNO VIA WHATSAPP (Grupo MAESTRI por {sender}):\n\n"
+                        f"\"{text}\"\n\n"
+                        f"⚡ COMANDO DE ENVIO COM GRUPO DE DESTINO DETECTADO:\n"
+                        f"Execute imediatamente no seu terminal:\n{cli_cmd}\n\n"
+                        f"Publique no grupo MAESTRI confirmando o envio da proposta #{target_id} para o grupo '{dest_grp}'."
+                    )
+                elif match_aprov and not has_custom_edits:
                     target_arg = match_aprov.group(1).lower()
                     cli_cmd = "python operacoes/executar_proposta.py --all" if target_arg in ("tudo", "todas") else f"python operacoes/executar_proposta.py --id {target_arg}"
                     stark_prompt = (

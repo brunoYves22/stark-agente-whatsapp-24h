@@ -104,7 +104,7 @@ from pathlib import Path
 import sys
 import time
 
-def executar_proposta(root, prop_id=None, execute_all=False):
+def executar_proposta(root, prop_id=None, execute_all=False, override_destination=None, ignore_only=False):
     root = Path(root)
     sys.path.insert(0, str(root))
 
@@ -138,6 +138,15 @@ def executar_proposta(root, prop_id=None, execute_all=False):
     if not to_execute:
         return {"ok": False, "error": f"Proposta {prop_id} não encontrada ou já executada."}
 
+    if ignore_only:
+        ignored_results = []
+        for item in to_execute:
+            item["status"] = "ignorada"
+            item["updated_at"] = time.time()
+            ignored_results.append(f"🚫 Proposta [{item.get('id')}] ({item.get('area')}) marcada como ignorada.")
+        p_file.write_text(json.dumps(propostas, ensure_ascii=False, indent=2), encoding="utf-8")
+        return {"ok": True, "results": ignored_results}
+
     # Carregar cliente WhatsApp
     import operacoes.whatsapp as op_wa
     from operacoes.whatsapp import Client
@@ -155,11 +164,17 @@ def executar_proposta(root, prop_id=None, execute_all=False):
     for item in to_execute:
         pid = item.get("id")
         area = item.get("area")
+        if override_destination and str(override_destination).strip():
+            item["destination"] = str(override_destination).strip()
         dest = item.get("destination")
         channel = item.get("channel")
         msg = item.get("draft_message")
         from operacoes.formatacao_whatsapp import organizar_mensagem_whatsapp
         msg = organizar_mensagem_whatsapp(msg)
+
+        if channel in ("whatsapp_grupo", "whatsapp_privado") and (not dest or dest == "A_DEFINIR"):
+            results.append(f"⚠️ Proposta [{pid}] aguarda definição do grupo. Use: @Stark enviar {pid} para <Nome do Grupo>")
+            continue
 
         print(f"[*] Processando Proposta [{pid}] para '{dest}'...")
 
@@ -214,13 +229,15 @@ if __name__ == "__main__":
     parser.add_argument("--runtime", default=r"./runtime")
     parser.add_argument("--id", help="ID da proposta (ex: 1)")
     parser.add_argument("--all", action="store_true", help="Executar todas as propostas pendentes")
+    parser.add_argument("--destino", help="Sobrescrever o grupo ou contato de destino no WhatsApp")
+    parser.add_argument("--ignorar", action="store_true", help="Marcar a proposta como ignorada sem enviar")
     args = parser.parse_args()
 
     if not args.id and not args.all:
         print("Informe --id <numero> ou --all")
         sys.exit(1)
 
-    res = executar_proposta(args.runtime, prop_id=args.id, execute_all=args.all)
+    res = executar_proposta(args.runtime, prop_id=args.id, execute_all=args.all, override_destination=args.destino, ignore_only=args.ignorar)
     if res.get("ok"):
         for line in res.get("results", []):
             print(line)
