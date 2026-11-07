@@ -116,6 +116,15 @@ def executar_proposta(root, prop_id=None, execute_all=False):
     if not propostas:
         return {"ok": False, "error": "Lista de propostas pendentes está vazia."}
 
+    now_ts = time.time()
+    expired_changed = False
+    for p in propostas:
+        if p.get("status") == "aguardando_aprovacao" and p.get("created_at") and (now_ts - float(p["created_at"])) > 7 * 86400:
+            p["status"] = "expirada"
+            expired_changed = True
+    if expired_changed:
+        p_file.write_text(json.dumps(propostas, ensure_ascii=False, indent=2), encoding="utf-8")
+
     reg = json.loads((root / "registry.json").read_text(encoding="utf-8-sig"))
     stark_tid = reg["roles"]["orquestrador"]["terminalId"]
 

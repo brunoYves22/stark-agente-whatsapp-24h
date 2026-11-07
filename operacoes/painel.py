@@ -84,12 +84,29 @@ def status_snapshot(runtime):
     data=legacy_snapshot(runtime);data['management']=overview(runtime);data['version']=VERSION
     try:
         hb_f=Path(runtime)/'operacoes/heartbeats/sentinela-whatsapp.json'
-        data['stark_sentinel']=json.loads(hb_f.read_text(encoding='utf-8')) if hb_f.exists() else {'state':'ativo','whisper_warm':True}
+        if hb_f.exists():
+            shb=json.loads(hb_f.read_text(encoding='utf-8'))
+            stale=(time.time()-float(shb.get('observed',0)))>35
+            raw_st=shb.get('status') or shb.get('state') or 'aguardando_portal'
+            shb['state']='offline' if stale else ('qr_pendente' if (shb.get('qr_required') or raw_st=='qr_pendente') else ('ativo' if raw_st in ('online','ativo') else 'aguardando_portal'))
+            data['stark_sentinel']=shb
+        else:
+            data['stark_sentinel']={'state':'offline','status':'offline'}
     except Exception:
-        data['stark_sentinel']={'state':'ativo','whisper_warm':True}
+        data['stark_sentinel']={'state':'offline','status':'offline'}
     try:
         pf=Path(runtime)/'operacoes/propostas_pendentes.json'
-        data['pending_proposals']=sum(1 for x in json.loads(pf.read_text(encoding='utf-8')) if x.get('status')=='aguardando_aprovacao') if pf.exists() else 0
+        if pf.exists():
+            now_ts=time.time()
+            plist=json.loads(pf.read_text(encoding='utf-8'))
+            if any(x.get('status')=='aguardando_aprovacao' and x.get('created_at') and (now_ts-float(x['created_at']))>7*86400 for x in plist):
+                for x in plist:
+                    if x.get('status')=='aguardando_aprovacao' and x.get('created_at') and (now_ts-float(x['created_at']))>7*86400:
+                        x['status']='expirada'
+                pf.write_text(json.dumps(plist,ensure_ascii=False,indent=2),encoding='utf-8')
+            data['pending_proposals']=sum(1 for x in plist if x.get('status')=='aguardando_aprovacao')
+        else:
+            data['pending_proposals']=0
     except Exception:
         data['pending_proposals']=0
     for agent in data['agents']:

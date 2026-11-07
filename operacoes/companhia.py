@@ -37,9 +37,33 @@ def run(root):
                 try:serve(root)
                 except Exception:time.sleep(20)
         threading.Thread(target=panel,daemon=True).start()
+        def ensure_sentinel(r_root):
+            hb_file=r_root/'operacoes/heartbeats/sentinela-whatsapp.json'
+            stale=True
+            if hb_file.exists():
+                try:
+                    hb=json.loads(hb_file.read_text(encoding='utf-8'))
+                    stale=(time.time()-float(hb.get('observed',0)))>45
+                except Exception:
+                    stale=True
+            if not stale:
+                return
+            import socket,subprocess
+            try:
+                with socket.create_connection(('127.0.0.1',58377),timeout=0.5):
+                    return
+            except OSError:
+                pass
+            sentinel_script=r_root/'operacoes/sentinela_whatsapp_stark.py'
+            if sentinel_script.exists():
+                subprocess.Popen([sys.executable,'-X','utf8',str(sentinel_script),'--runtime',str(r_root)],
+                                 cwd=str(r_root),stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,
+                                 creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0x08000000))
+        ensure_sentinel(root)
         last_free=0
         while True:
             try:
+                ensure_sentinel(root)
                 free=time.time()-last_free>=300
                 refresh_quotas(root,free)
                 if free:last_free=time.time()

@@ -148,21 +148,119 @@ def get_whisper_model(root):
         _WHISPER_MODEL = WhisperModel("base", device="cpu", compute_type="int8", download_root=str(cfg))
     return _WHISPER_MODEL
 
-def write_sentinel_heartbeat(root, server_state):
+DEFAULT_ALLOWED_SENDERS = [
+    "bruno",
+    "bruno yves",
+    "bruno yves monteiro de paula",
+    "você",
+    "voce",
+    "yves",
+    "558396389941",
+    "5583996389941",
+    "8396389941",
+    "83996389941",
+]
+
+def log_event(root: Path, message: str):
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{ts}] {message}"
+    print(line, flush=True)
+    try:
+        log_dir = root / "operacoes" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / "sentinela-whatsapp.log"
+        if log_file.exists() and log_file.stat().st_size > 1_000_000:
+            tail = log_file.read_bytes()[-500_000:]
+            log_file.write_bytes(tail)
+        with log_file.open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+def load_allowed_senders(root: Path) -> set:
+    cfg_file = root / "operacoes" / "stark_allowed_senders.json"
+    if not cfg_file.exists():
+        try:
+            cfg_file.write_text(json.dumps(DEFAULT_ALLOWED_SENDERS, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+        return set(DEFAULT_ALLOWED_SENDERS)
+    try:
+        items = json.loads(cfg_file.read_text(encoding="utf-8"))
+        return {str(x).strip().lower() for x in items if str(x).strip()} | set(DEFAULT_ALLOWED_SENDERS)
+    except Exception:
+        return set(DEFAULT_ALLOWED_SENDERS)
+
+def verify_sender_authorized(pre: str, root: Path):
+    """Extrai remetente do atributo data-pre-plain-text e valida contra a allowlist de Bruno."""
+    raw_sender = pre.split("]", 1)[-1].replace(":", "").strip() if "]" in (pre or "") else ""
+    if not raw_sender:
+        return True, "Bruno"
+    norm = raw_sender.lower().strip()
+    digits = re.sub(r"\D", "", raw_sender)
+    allowed = load_allowed_senders(root)
+    if norm in allowed or (digits and digits in allowed):
+        return True, "Bruno"
+    return False, raw_sender
+
+def expire_old_proposals(root: Path, max_age_days: int = 7):
+    try:
+        p_file = root / "operacoes" / "propostas_pendentes.json"
+        if not p_file.exists():
+            return
+        props = json.loads(p_file.read_text(encoding="utf-8"))
+        now_ts = time.time()
+        changed = False
+        for p in props:
+            if p.get("status") == "aguardando_aprovacao" and p.get("created_at") and (now_ts - float(p["created_at"])) > max_age_days * 86400:
+                p["status"] = "expirada"
+                changed = True
+        if changed:
+            p_file.write_text(json.dumps(props, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+def trigger_windows_alert(root: Path, title: str, message: str):
+    log_event(root, f"[ALERTA] {title}: {message}")
+    ps_script = (
+        "Add-Type -AssemblyName System.Windows.Forms; "
+        "Add-Type -AssemblyName System.Drawing; "
+        "$n = New-Object System.Windows.Forms.NotifyIcon; "
+        "$n.Icon = [System.Drawing.SystemIcons]::Warning; "
+        "$n.Visible = $true; "
+        f"$n.ShowBalloonTip(8000, '{title.replace(chr(39), '')}', '{message.replace(chr(39), '')}', [System.Windows.Forms.ToolTipIcon]::Warning); "
+        "Start-Sleep -Seconds 9; "
+        "$n.Dispose()"
+    )
+    try:
+        subprocess.Popen(
+            ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps_script],
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        pass
+
+def write_sentinel_heartbeat(root, server_state, alert_msg=None):
     try:
         hb_dir = root / "operacoes" / "heartbeats"
         hb_dir.mkdir(parents=True, exist_ok=True)
         srv = server_state.get("server")
+        cur_status = getattr(srv, "current_status", "online") if srv else "online"
+        qr_req = getattr(srv, "qr_required", False) if srv else False
         hb_data = {
             "observed": time.time(),
             "service": "sentinela_whatsapp_stark",
             "group": GROUP_NAME,
-            "status": getattr(srv, "current_status", "online") if srv else "online",
+            "status": cur_status,
+            "state": "qr_pendente" if qr_req else ("ativo" if cur_status == "online" else "aguardando_portal"),
             "portal_name": getattr(srv, "portal_name", "WhatsApp — Atendimento FLOW #2") if srv else "WhatsApp — Atendimento FLOW #2",
             "portal_ready": getattr(srv, "portal_ready", False) if srv else False,
-            "qr_required": getattr(srv, "qr_required", False) if srv else False,
+            "qr_required": qr_req,
             "processed_count": getattr(srv, "processed_count", 0) if srv else 0,
-            "last_processed": getattr(srv, "last_processed", None) if srv else None
+            "last_processed": getattr(srv, "last_processed", None) if srv else None,
+            "alert": alert_msg,
         }
         (hb_dir / "sentinela-whatsapp.json").write_text(json.dumps(hb_data, ensure_ascii=False), encoding="utf-8")
     except Exception:
@@ -248,8 +346,12 @@ def monitor_loop(root, server_state):
     last_open_attempt = 0
     last_loop_ts = time.time()
     storage_persisted = False
+    offline_since = None
+    last_alert_ts = 0
 
-    print(f"[*] Sentinela Stark iniciado com Blindagem Anti-Desconexão LevelDB. Monitorando grupo '{GROUP_NAME}' 24h...")
+    expire_old_proposals(root)
+    load_allowed_senders(root)
+    log_event(root, f"Sentinela Stark iniciado com Blindagem Anti-Desconexão LevelDB + Allowlist. Monitorando grupo '{GROUP_NAME}' 24h...")
 
     while True:
         try:
@@ -299,11 +401,31 @@ def monitor_loop(root, server_state):
                 time.sleep(8)
                 continue
 
+            cur_st = "qr_pendente" if qr_required else ("online" if portal_ready else "aguardando_portal")
             if "server" in server_state:
                 server_state["server"].portal_ready = portal_ready and not qr_required
                 server_state["server"].qr_required = qr_required
-                server_state["server"].current_status = "qr_pendente" if qr_required else ("online" if portal_ready else "aguardando_portal")
-            write_sentinel_heartbeat(root, server_state)
+                server_state["server"].current_status = cur_st
+
+            alert_note = None
+            if cur_st == "online":
+                offline_since = None
+            else:
+                if offline_since is None:
+                    offline_since = now
+                offline_dur = now - offline_since
+                if qr_required:
+                    alert_note = "WhatsApp Web desconectado: escaneie o QR Code no Portal Maestri."
+                    if offline_dur >= 15 and (now - last_alert_ts) > 1800:
+                        trigger_windows_alert(root, "Stark 24h · QR Code Pendente", alert_note)
+                        last_alert_ts = now
+                elif offline_dur >= 120:
+                    alert_note = f"Portal WhatsApp Maestri indisponível há {int(offline_dur // 60)} min."
+                    if (now - last_alert_ts) > 1800:
+                        trigger_windows_alert(root, "Stark 24h · Aguardando Portal Maestri", alert_note)
+                        last_alert_ts = now
+
+            write_sentinel_heartbeat(root, server_state, alert_msg=alert_note)
 
             # Não interagir com o DOM enquanto estiver na tela de QR Code ou sincronizando banco inicial
             if not portal_ready or qr_required or is_syncing:
@@ -399,12 +521,14 @@ def monitor_loop(root, server_state):
                     continue
                 recent_cmd_hashes[cmd_hash] = now
 
-                # Determinar remetente
-                sender = pre.split("]")[-1].replace(":", "").strip() if "]" in pre else "Bruno"
-                if not sender or sender.lower() in ("você", "voce", "yves"):
-                    sender = "Bruno"
+                # FILTRO 4: Autorização estrita de remetente (Allowlist Bruno)
+                authorized, sender = verify_sender_authorized(pre, root)
+                if not authorized:
+                    log_event(root, f"[SEGURANÇA] Comando @Stark bloqueado de remetente não autorizado ('{sender}'): '{text[:80]}'")
+                    continue
 
-                print(f"\n[!] GATILHO VÁLIDO de {sender}: '{text}'")
+                expire_old_proposals(root)
+                log_event(root, f"[GATILHO VÁLIDO] de {sender}: '{text[:120]}'")
 
                 # Injetar tarefa no terminal do Stark via Maestri IPC com DIRETRIZ SUPREMA DE AUTONOMIA
                 match_aprov = re.search(r'(?i)(?:aprova[r]?|ok|sim|enviar|envia|manda|dispara|executa[r]?|confirma[r]?)?\s*(\d+|tudo|todas|all)\b', text)
